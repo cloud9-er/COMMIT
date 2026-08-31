@@ -1,160 +1,138 @@
-from http.cookies import SimpleCookie
-from urllib.parse import urlparse
+from base import decompose
+
+
+class Request:
+    """
+    User-level HTTP request.
+
+    This represents what the caller wants to send.
+    It is NOT the final wire-ready request.
+    """
+
+    def __init__(
+        self,
+        method,
+        url,
+        headers=None,
+        auth=None,
+    ):
+        self.method = method.upper()
+        self.url = url
+        self.headers = dict(headers or {})
+        self.auth = auth
+
+
+class PreparedRequest:
+    """
+    Fully prepared request ready to be sent through a Connection.
+
+    This is the boundary between request preparation and
+    network communication.
+    """
+
+    def __init__(
+        self,
+        method,
+        url,
+        headers,
+        body=None,
+        auth=None,
+    ):
+        self.method = method
+        self.url = url
+        self.headers = headers
+        self.body = body
+        self.auth = auth
+
+        self.parsed_url = decompose(url)
+
+    @property
+    def path(self):
+        return self.parsed_url.path_qs
 
 
 class SessionState:
     """
-    Stores HTTP state that persists across requests.
+    Persistent non-cookie state belonging to a Session.
     """
 
     def __init__(
         self,
         headers=None,
-        cookies=None,
         auth=None,
         defaults=None,
     ):
         self.headers = dict(headers or {})
-        self.cookies = dict(cookies or {})
         self.auth = auth
         self.defaults = dict(defaults or {})
 
-    def prepare_request(self, request):
-        """
-        Apply persistent session state to a Request.
-        """
-
-        # Session headers provide defaults.
-        for name, value in self.headers.items():
-            if name not in request.headers:
-                request.headers[name] = value
-
-        # Session cookies provide defaults.
-        for name, value in self.cookies.items():
-            if name not in request.cookies:
-                request.cookies[name] = value
-
-        # Session authentication is used when the request
-        # does not provide its own authentication.
-        if request.auth is None:
-            request.auth = self.auth
-
-        # Apply other session-level defaults.
-        for name, value in self.defaults.items():
-            if not hasattr(request, name) or getattr(request, name) is None:
-                setattr(request, name, value)
-
-        return request
-
-    def update_from_response(self, response):
-        """
-        Update persistent state using information from a Response.
-        """
-
-        set_cookie = response.headers.get("Set-Cookie")
-
-        if set_cookie:
-            cookie = SimpleCookie()
-            cookie.load(set_cookie)
-
-            for name, morsel in cookie.items():
-                self.cookies[name] = morsel.value
-
     def clear(self):
-        """Clear all persistent session state."""
         self.headers.clear()
-        self.cookies.clear()
         self.auth = None
         self.defaults.clear()
 
 
-class Session:
+class SessionManager:
     """
-    High-level HTTP session.
+    Builds PreparedRequest objects.
+
+    SessionManager does NOT:
+        - open connections
+        - send requests
+        - own cookies
+
+    It only combines request/session/header/cookie state.
     """
 
-    def __init__(self, connection_manager, state=None):
-        self.connection_manager = connection_manager
+    def __init__(
+        self,
+        header_manager,
+        cookie_engine,
+        state=None,
+    ):
+        self.header_manager = header_manager
+        self.cookie_engine = cookie_engine
         self.state = state or SessionState()
 
-    def request(
-        self,
-        method,
-        url,
-        headers=None,
-        cookies=None,
-        auth=None,
-        **kwargs,
-    ):
+    def prepare_request(self, request):
         """
-        Execute one HTTP request using persistent session state.
+        Convert Request -> PreparedRequest.
         """
 
-        # Request is assumed to be an existing project component.
-        request = Request(
-            method=method,
-            url=url,
-            headers=headers or {},
-            cookies=cookies or {},
-            auth=auth,
-            **kwargs,
+        # Header precedence:
+        #
+        # manager < session < request
+        headers = self.header_manager.merge_headers(
+            session_headers=self.state.headers,
+            request_headers=request.headers,
         )
 
-        # Apply persistent state.
-        request = self.state.prepare_request(request)
-
-        # Determine the connection key.
-        parsed = urlparse(url)
-
-        connection_key = (
-            parsed.scheme,
-            parsed.hostname,
-            parsed.port or self._default_port(parsed.scheme),
+        # CookieEngine is the sole owner of cookie state.
+        cookie_header = self.cookie_engine.get_cookie_header(
+            request.url
         )
 
-        # Ask the connection manager for a connection.
-        connection = self.connection_manager.acquire(connection_key)
+        if cookie_header is not None:
+            self._set_header_case_insensitive(
+                headers,
+                "Cookie",
+                cookie_header,
+            )
 
-        try:
-            # Connection is a black-box object.
-            response = connection.send(request)
-
-            # Let SessionState inspect the response.
-            self.state.update_from_response(response)
-
-            return response
-
-        finally:
-            # Always return the connection to the manager.
-            self.connection_manager.release(connection)
-
-    def get(self, url, **kwargs):
-        return self.request("GET", url, **kwargs)
-
-    def post(self, url, **kwargs):
-        return self.request("POST", url, **kwargs)
-
-    def put(self, url, **kwargs):
-        return self.request("PUT", url, **kwargs)
-
-    def delete(self, url, **kwargs):
-        return self.request("DELETE", url, **kwargs)
-
-    def close(self):
-        """
-        Session itself does not own the connection manager,
-        so closing the session does not necessarily mean closing
-        shared connection infrastructure.
-        """
-
-        self.state.clear()
+        # auth is intentionally accepted but unused.
+        return PreparedRequest(
+            method=request.method,
+            url=request.url,
+            headers=headers,
+            body=self.state.defaults.get("body"),
+            auth=request.auth,
+        )
 
     @staticmethod
-    def _default_port(scheme):
-        if scheme == "http":
-            return 80
+    def _set_header_case_insensitive(headers, name, value):
+        """Set a header while avoiding duplicate case variants."""
+        for existing_name in list(headers):
+            if existing_name.lower() == name.lower():
+                del headers[existing_name]
 
-        if scheme == "https":
-            return 443
-
-        raise ValueError(f"Unsupported scheme: {scheme}")
+        headers[name] = value

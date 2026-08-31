@@ -1,0 +1,708 @@
+# Mini HTTP Client
+
+A small educational reimplementation of the core structure of a persistent HTTP client using only Python's standard library.
+
+The project separates:
+
+- URL parsing
+- request representation and preparation
+- session state
+- header management
+- cookie management
+- connection pooling
+- high-level session orchestration
+
+The goal is not to reproduce the full `requests` library. The goal is to build a small, understandable HTTP stack with clear ownership boundaries.
+
+---
+
+## Architecture
+
+```text
+                         Session
+                       orchestrator
+                            |
+              +-------------+-------------+
+              |             |             |
+              v             v             v
+           Request     SessionState   SessionManager
+                                          |
+                               +----------+----------+
+                               |                     |
+                               v                     v
+                         HeaderManager          CookieEngine
+                               |                     |
+                               +----------+----------+
+                                          |
+                                          v
+                                  PreparedRequest
+                                          |
+                                          v
+                                 ConnectionManager
+                                          |
+                                          v
+                                      Connection
+                                          |
+                                          v
+                                      Response
+                                          |
+                                          v
+                                    CookieEngine
+```
+
+---
+
+## Files
+
+```text
+.
+├── base.py
+├── connection_manager.py
+├── cookie_engine.py
+├── header_manager.py
+├── session_manager.py
+├── integrated.py
+└── README.md
+```
+
+### `base.py`
+
+Provides URL decomposition.
+
+`decompose(url)` converts a URL into a `ParsedURL` object containing:
+
+- scheme
+- host
+- port
+- path
+- query
+- fragment
+
+`ParsedURL.path_qs` produces the HTTP request target, combining the path and query string.
+
+This file is kept separate from the HTTP connection layer.
+
+---
+
+### `connection_manager.py`
+
+Owns all network connections.
+
+Its main components are:
+
+- `Connection`
+- `ConnectionPool`
+- `HTTPConnectionManager`
+- `ConnectionKey`
+- `ConnectionState`
+
+The `HTTPConnectionManager` is the only component allowed to create/acquire connections.
+
+A caller does not construct `Connection` objects directly.
+
+The manager supports:
+
+- persistent connections
+- per-pool connection limits
+- global connection limits
+- connection reuse
+- idle/active tracking
+- waiting when capacity is exhausted
+- connection failure handling
+- HTTP and HTTPS connections
+
+The existing connection-manager design is treated as a black box by the higher-level session code.
+
+---
+
+### `header_manager.py`
+
+Owns persistent/default headers and performs header merging.
+
+Header precedence is:
+
+```text
+Manager headers
+       ↓
+Session headers
+       ↓
+Request headers
+```
+
+Therefore:
+
+```text
+request > session > manager
+```
+
+Header comparison is case-insensitive so that:
+
+```text
+Accept
+accept
+ACCEPT
+```
+
+are treated as the same HTTP header.
+
+The final merged headers are supplied to `SessionManager`.
+
+---
+
+### `cookie_engine.py`
+
+Owns the complete cookie mechanism.
+
+It uses Python's standard-library `http.cookiejar.CookieJar`.
+
+Responsibilities:
+
+1. Store cookies.
+2. Determine which cookies apply to a URL.
+3. Generate the outgoing `Cookie` header.
+4. Extract cookies from response headers.
+5. Persist cookies to JSON.
+6. Restore cookies from JSON.
+
+There is deliberately only one cookie authority.
+
+`SessionState` does **not** maintain a second cookie dictionary.
+
+---
+
+### `session_manager.py`
+
+Responsible for request preparation.
+
+It contains:
+
+- `Request`
+- `PreparedRequest`
+- `SessionState`
+- `SessionManager`
+
+#### Request
+
+Represents what the caller wants to send.
+
+It contains:
+
+```text
+method
+url
+headers
+auth
+```
+
+It is not responsible for network communication.
+
+#### PreparedRequest
+
+Represents the final request prepared for the connection layer.
+
+It contains:
+
+```text
+method
+url
+headers
+body
+auth
+parsed_url
+```
+
+The connection layer receives information from this object rather than dealing with the original user-level `Request`.
+
+#### SessionState
+
+Stores persistent session-level state such as:
+
+- headers
+- authentication value
+- other session defaults
+
+Cookies are intentionally excluded because they belong exclusively to `CookieEngine`.
+
+#### SessionManager
+
+Transforms:
+
+```text
+Request
+   ↓
+PreparedRequest
+```
+
+It combines:
+
+- manager headers
+- session headers
+- request headers
+- cookies generated by `CookieEngine`
+
+It does not:
+
+- acquire connections
+- send network requests
+- own cookie storage
+
+---
+
+## `Session`
+
+`Session` is the high-level orchestrator.
+
+There is no separate `HTTPClient` wrapper.
+
+The user interacts directly with `Session`.
+
+Example:
+
+```python
+from integrated import Session
+
+session = Session()
+
+response = session.get("https://example.com/")
+```
+
+The lifecycle is:
+
+```text
+Session.request()
+       |
+       v
+Create Request
+       |
+       v
+SessionManager.prepare_request()
+       |
+       v
+PreparedRequest
+       |
+       v
+ConnectionManager.acquire()
+       |
+       v
+(pool, connection)
+       |
+       v
+Connection.request()
+       |
+       v
+Response
+       |
+       +----> CookieEngine.extract_from_response()
+       |
+       v
+ConnectionManager.release()
+```
+
+---
+
+## Request Preparation
+
+A request starts as a simple user-level object:
+
+```python
+request = Request(
+    method="GET",
+    url="https://example.com/",
+    headers={
+        "Accept": "application/json"
+    }
+)
+```
+
+`SessionManager` then constructs the final headers.
+
+For example:
+
+```text
+Manager:
+    User-Agent = MyScraperBot/1.0
+    Accept     = text/html
+
+Session:
+    Accept     = application/json
+
+Request:
+    User-Agent = MyApplication/1.0
+```
+
+The resulting headers are:
+
+```text
+User-Agent = MyApplication/1.0
+Accept     = application/json
+```
+
+The request-specific values win.
+
+---
+
+## Cookie Flow
+
+Cookies are not manually copied between session objects.
+
+The flow is:
+
+```text
+CookieJar
+    |
+    | get_cookie_header(url)
+    v
+SessionManager
+    |
+    v
+PreparedRequest
+    |
+    v
+Connection
+    |
+    v
+Response
+    |
+    | Set-Cookie
+    v
+CookieEngine
+    |
+    v
+CookieJar
+```
+
+This allows the `CookieJar` to apply normal cookie matching rules based on the request URL.
+
+For example:
+
+```python
+session.get("https://example.com/")
+```
+
+may cause the cookie engine to add:
+
+```http
+Cookie: session_id=abc123
+```
+
+If the server returns:
+
+```http
+Set-Cookie: session_id=xyz789
+```
+
+the response is passed back to `CookieEngine`, which updates its `CookieJar`.
+
+---
+
+## Connection Ownership
+
+Connections are owned by `HTTPConnectionManager`.
+
+The ownership rule is:
+
+> Higher-level code never constructs or owns individual `Connection` objects.
+
+The session asks:
+
+```python
+pool, connection = connection_manager.acquire(parsed_url)
+```
+
+The connection is then used:
+
+```python
+response = connection.request(
+    method,
+    path,
+    body=body,
+    headers=headers,
+)
+```
+
+Finally:
+
+```python
+connection_manager.release(pool, connection)
+```
+
+This preserves connection pooling and the manager's global connection accounting.
+
+---
+
+## Connection Lifecycle
+
+A connection moves through states such as:
+
+```text
+NEW
+ |
+ v
+CONNECTING
+ |
+ v
+IDLE <------+
+ |          |
+ v          |
+ACTIVE -----+
+ |
+ v
+IDLE
+
+Failure:
+ACTIVE/CONNECTING
+        |
+        v
+     FAILED
+        |
+        v
+     CLOSED
+```
+
+An idle usable connection can be reused.
+
+A failed or unusable connection is discarded rather than returned to the idle pool.
+
+---
+
+## Resource Limits
+
+The connection manager has two levels of limits.
+
+### Global limit
+
+```python
+HTTPConnectionManager(
+    max_connections=20
+)
+```
+
+This limits the total number of connections across all pools.
+
+### Per-pool limit
+
+```python
+HTTPConnectionManager(
+    max_connections=20,
+    max_connections_per_pool=5
+)
+```
+
+This limits the number of connections for an individual:
+
+```text
+scheme + host + port
+```
+
+combination.
+
+If capacity is exhausted, waiting threads wait on the pool condition until a connection becomes available.
+
+---
+
+## Authentication
+
+`auth` is accepted by the request/session interfaces:
+
+```python
+session.get(
+    url,
+    auth=some_value
+)
+```
+
+However, authentication behavior is intentionally **not implemented yet**.
+
+The parameter exists so authentication can be integrated later without changing the public request interface.
+
+---
+
+## Deliberate Non-Features
+
+The current architecture intentionally does **not** implement:
+
+- per-request cookie overrides
+- authentication behavior
+- an `HTTPClient` wrapper
+- advanced redirect handling
+- streaming abstractions
+- multipart encoding
+- proxy handling
+- HTTP/2
+- asynchronous I/O
+- automatic retry policies
+- full `requests` compatibility
+
+These should not be added casually. Each would introduce additional ownership and lifecycle decisions.
+
+---
+
+## Important Interface Boundaries
+
+### Session → SessionManager
+
+```python
+Request
+    ↓
+prepare_request()
+    ↓
+PreparedRequest
+```
+
+### Session → ConnectionManager
+
+```python
+ParsedURL
+    ↓
+acquire()
+    ↓
+(pool, Connection)
+```
+
+### Session → Connection
+
+```python
+PreparedRequest
+    ↓
+connection.request(...)
+    ↓
+Response
+```
+
+### Session → CookieEngine
+
+```python
+Response
+    ↓
+extract_from_response(...)
+```
+
+The session is therefore the coordinator rather than the owner of every subsystem.
+
+---
+
+## Example
+
+```python
+from connection_manager import HTTPConnectionManager
+from integrated import Session
+
+
+manager = HTTPConnectionManager(
+    max_connections=20,
+    max_connections_per_pool=5,
+)
+
+session = Session(
+    connection_manager=manager
+)
+
+response = session.get(
+    "https://example.com/",
+    headers={
+        "Accept": "text/html"
+    }
+)
+
+print(response.status)
+
+# Consume the response before allowing the
+# persistent HTTP connection to be reused.
+body = response.read()
+
+session.close()
+manager.close()
+```
+
+---
+
+## Design Principles
+
+### 1. Single responsibility
+
+Each component owns one major concern.
+
+```text
+base.py                → URL decomposition
+HeaderManager          → headers
+CookieEngine            → cookies
+SessionManager          → preparation
+Connection              → network connection
+ConnectionPool          → pool lifecycle
+HTTPConnectionManager   → connection ownership
+Session                 → orchestration
+```
+
+### 2. Clear ownership
+
+There should not be two objects independently managing the same state.
+
+In particular:
+
+```text
+Cookies → CookieEngine
+Connections → ConnectionManager
+```
+
+### 3. Preparation before transmission
+
+The request is prepared completely before reaching the connection layer.
+
+```text
+Request
+  ↓
+PreparedRequest
+  ↓
+Connection
+```
+
+The connection should not have to understand session state.
+
+### 4. Network layer isolation
+
+The session does not construct sockets or `HTTPConnection` objects.
+
+The connection manager handles that complexity.
+
+### 5. Persistent session state
+
+A `Session` represents a persistent HTTP interaction rather than a single request.
+
+This allows headers and cookies to persist across requests.
+
+---
+
+## Current Architectural Contract
+
+The following decisions are considered fixed unless the architecture is deliberately revised:
+
+1. `Request` is retained.
+2. `SessionManager` builds `PreparedRequest`.
+3. Header precedence is:
+
+   ```text
+   request > session > manager
+   ```
+
+4. `CookieEngine` is the sole cookie authority.
+5. `Session` orchestrates cookie generation and extraction.
+6. Per-request cookie overrides are excluded.
+7. `auth` is accepted but unused.
+8. All connections come from `HTTPConnectionManager`.
+9. The `ConnectionManager → (pool, connection)` interface is retained.
+10. `Connection.request()` is the network-send interface.
+11. `Session` is used directly.
+12. There is no `HTTPClient` wrapper.
+13. `base.py` and `connection_manager.py` remain independent lower-level components.
+
+---
+
+## Next Engineering Pressure Point
+
+The architecture is now coherent enough to move into behavioral testing.
+
+The next important issue is **response consumption and connection reuse**.
+
+With persistent HTTP connections, the response body must be handled correctly before a connection is returned to the idle pool. Otherwise, unread response data can corrupt or interfere with the next request using that connection.
+
+That behavior should be explicitly designed and tested before adding higher-level features.
