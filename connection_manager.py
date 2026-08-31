@@ -1,3 +1,5 @@
+import socket
+
 import http.client
 import ssl
 import threading
@@ -66,6 +68,13 @@ class Connection:
             self.state = ConnectionState.IDLE
             self.last_used_at = time.monotonic()
 
+        #added for timeout
+        except socket.timeout:
+            self.state = ConnectionState.FAILED
+            self.close()
+            raise
+
+        
         except Exception:
             self.state = ConnectionState.FAILED
             self.close()
@@ -98,6 +107,12 @@ class Connection:
             self.last_used_at = time.monotonic()
 
             return response
+
+        #added timeout exception handling
+        except socket.timeout:
+            self.state = ConnectionState.FAILED
+            self.close()
+            raise
 
         except Exception:
             self.state = ConnectionState.FAILED
