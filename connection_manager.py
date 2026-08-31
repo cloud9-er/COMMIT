@@ -7,7 +7,6 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum, auto
-from urllib.parse import urlparse
 
 @dataclass(frozen=True)
 class ConnectionKey:
@@ -351,23 +350,25 @@ class HTTPConnectionManager:
             if self.total_connections > 0:
                 self.total_connections -= 1
 
-    def acquire(self, url):
-
-        parsed = urlparse(url)
+    def acquire(self, parsed):
+        """
+        Get a (pool, connection) pair for the given ParsedURL.
+        This is the only way a Connection should ever be obtained --
+        callers never construct Connection objects themselves.
+        """
 
         if parsed.scheme not in ("http", "https"):
             raise ValueError(
                 "Only HTTP and HTTPS are supported."
             )
 
-        port = parsed.port
-
-        if port is None:
-            port = 443 if parsed.scheme == "https" else 80
+        # Respect an explicit port from the URL; fall back to the
+        # scheme's default only when none was given.
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
 
         key = ConnectionKey(
             scheme=parsed.scheme,
-            host=parsed.hostname,
+            host=parsed.host,
             port=port,
         )
 
